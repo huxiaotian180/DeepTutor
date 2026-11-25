@@ -25,20 +25,20 @@ export interface ClientEdition {
   short: string;
 }
 
-const WEB: ClientEdition = { full: "Open DeepTutor Web", short: "Web" };
+const WEB: ClientEdition = { full: "Open chazuo Web", short: "Web" };
 const EDITIONS: Record<string, ClientEdition> = {
   "macOS; arm64": {
-    full: "Open DeepTutor for MacOS with Apple Silicon",
+    full: "Open chazuo for MacOS with Apple Silicon",
     short: "MacOS (Apple Silicon)",
   },
   "macOS; x64": {
-    full: "Open DeepTutor for MacOS with Intel Silicon",
+    full: "Open chazuo for MacOS with Intel Silicon",
     short: "MacOS (Intel)",
   },
-  "Windows; x64": { full: "Open DeepTutor for Windows", short: "Windows" },
+  "Windows; x64": { full: "Open chazuo for Windows", short: "Windows" },
   // Shells from 1.7.0 sent no architecture.
-  macOS: { full: "Open DeepTutor for MacOS", short: "MacOS" },
-  Windows: { full: "Open DeepTutor for Windows", short: "Windows" },
+  macOS: { full: "Open chazuo for MacOS", short: "MacOS" },
+  Windows: { full: "Open chazuo for Windows", short: "Windows" },
 };
 
 /** The desktop shell appends ``OpenDeepTutor/<version> (macOS; arm64)`` to its user agent. */
