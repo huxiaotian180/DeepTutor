@@ -4,6 +4,7 @@ import asyncio
 from collections import OrderedDict
 import importlib.util
 import os
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -33,6 +34,15 @@ MSG_TYPE_MAP = {
     "voice": "[voice]",
     "file": "[file]",
     "mixed": "[mixed content]",
+}
+
+# WeCom's stream reply carries attachments through `msg_item`, but the platform
+# accepted those frames without ever rendering the image, so outbound files go
+# through the temporary-media upload (media_id) path instead.
+MEDIA_TYPE_BY_SUFFIX = {
+    **dict.fromkeys((".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"), "image"),
+    **dict.fromkeys((".aac", ".amr", ".flac", ".m4a", ".mp3", ".ogg", ".silk", ".wav"), "voice"),
+    **dict.fromkeys((".avi", ".flv", ".mkv", ".mov", ".mp4", ".webm"), "video"),
 }
 
 
@@ -387,6 +397,12 @@ class WecomChannel(BaseChannel):
         # Use streaming reply for better UX
         stream_id = self._generate_req_id("stream")
 
+        # Attachments go out as their own media messages first; they used to be
+        # dropped here entirely, leaving the model to say "the image is above" over
+        # a text-only reply. Text must survive a failed upload, so each file is
+        # reported and skipped instead of aborting the turn.
+        await self._send_media(frame, msg)
+
         # Send as streaming message with finish=True
         await self._client.reply_stream(
             frame,
@@ -396,3 +412,31 @@ class WecomChannel(BaseChannel):
         )
 
         logger.debug("WeCom message sent to {}", msg.chat_id)
+
+    async def _send_media(self, frame: Any, msg: OutboundMessage) -> None:
+        """Upload each attachment as temporary media and reply with it.
+
+        ``reply_stream``'s inline ``msg_item`` slot gets acknowledged by the server
+        without rendering anything, so the temporary-media upload (chunked over the
+        same WebSocket, then a media_id reply) is the path that actually delivers.
+        """
+        for media_path in msg.media or []:
+            path = Path(media_path)
+            if not path.is_file():
+                logger.warning("WeCom media file missing: {}", media_path)
+                continue
+            media_type = MEDIA_TYPE_BY_SUFFIX.get(path.suffix.lower(), "file")
+            try:
+                uploaded = await self._client.upload_media(
+                    path.read_bytes(), type=media_type, filename=path.name
+                )
+                media_id = (uploaded or {}).get("media_id")
+                if not media_id:
+                    logger.warning("WeCom upload returned no media_id for {}", path.name)
+                    continue
+                await self._client.reply_media(frame, media_type, media_id)
+                logger.info("WeCom media sent: {} ({})", path.name, media_type)
+            except Exception:
+                logger.opt(exception=True).warning(
+                    "Failed to send WeCom media {}", media_path
+                )

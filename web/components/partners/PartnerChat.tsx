@@ -608,6 +608,7 @@ export default function PartnerChat({
         activity_id?: string;
         channel?: string;
         external?: boolean;
+        attachments?: unknown;
       };
       try {
         data = JSON.parse(String(message.data));
@@ -674,6 +675,10 @@ export default function PartnerChat({
                     content: data.content || finished?.content || "",
                     activityId,
                     channel: data.channel,
+                    // IM turns arrive here, not through the history page: the
+                    // answer's published files ride along with the final frame
+                    // so relative paths in it resolve to real downloads.
+                    attachments: normalizeHistoryAttachments(data.attachments),
                     events: finished?.events.length
                       ? finished.events
                       : undefined,

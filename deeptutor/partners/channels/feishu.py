@@ -35,9 +35,21 @@ def _card_aware_ws_client(base_client: type[Any], ws_module: Any) -> type[Any]:
     The SDK's event dispatcher already understands card actions; older WS
     clients return before calling it. Keep the original CARD frame type when
     writing the callback response so Feishu can replace the clicked card.
+
+    The SDK's ``Client.start()`` also schedules every task on a module-level
+    ``loop`` global. Two partners with Feishu channels in one process each
+    re-patch that global from their listener thread, so one partner's receive
+    task lands on the other's loop and both die with
+    ``Task got Future attached to a different loop``. The overrides below pin
+    ``start``/``_connect``/``_receive_message_loop`` to a per-instance
+    ``_own_loop`` that the listener thread binds before starting the client.
     """
 
     class CardAwareClient(base_client):
+        # Bound by the channel's listener thread before ``start()``; never
+        # touch the SDK module's shared ``loop`` global (see docstring).
+        _own_loop: asyncio.AbstractEventLoop | None = None
+
         async def _handle_data_frame(self, frame: Any) -> None:
             message_type = ws_module._get_by_key(frame.headers, ws_module.HEADER_TYPE)
             if message_type != ws_module.MessageType.CARD.value:
@@ -72,6 +84,67 @@ def _card_aware_ws_client(base_client: type[Any], ws_module: Any) -> type[Any]:
 
             frame.payload = ws_module.JSON.marshal(response).encode(ws_module.UTF_8)
             await self._write_message(frame.SerializeToString())
+
+        def start(self) -> None:
+            loop = self._own_loop
+            if loop is None:
+                raise RuntimeError(
+                    "CardAwareClient.start() requires _own_loop bound by the listener thread"
+                )
+            try:
+                loop.run_until_complete(self._connect())
+            except ws_module.ClientException as e:
+                ws_module.logger.error(self._fmt_log("connect failed, err: {}", e))
+                raise e
+            except Exception as e:
+                ws_module.logger.error(self._fmt_log("connect failed, err: {}", e))
+                loop.run_until_complete(self._disconnect())
+                if self._auto_reconnect:
+                    loop.run_until_complete(self._reconnect())
+                else:
+                    raise e
+
+            loop.create_task(self._ping_loop())
+            loop.run_until_complete(ws_module._select())
+
+        async def _connect(self) -> None:
+            await self._lock.acquire()
+            if self._conn is not None:
+                return
+            try:
+                conn_url = self._get_conn_url()
+                u = ws_module.urlparse(conn_url)
+                q = ws_module.parse_qs(u.query)
+                conn_id = q[ws_module.DEVICE_ID][0]
+                service_id = q[ws_module.SERVICE_ID][0]
+
+                conn = await ws_module.websockets.connect(conn_url)
+                self._conn = conn
+                self._conn_url = conn_url
+                self._conn_id = conn_id
+                self._service_id = service_id
+
+                ws_module.logger.info(self._fmt_log("connected to {}", conn_url))
+                self._own_loop.create_task(self._receive_message_loop())
+            except ws_module.websockets.InvalidStatusCode as e:
+                ws_module._parse_ws_conn_exception(e)
+            finally:
+                self._lock.release()
+
+        async def _receive_message_loop(self) -> None:
+            try:
+                while True:
+                    if self._conn is None:
+                        raise ws_module.ConnectionClosedException("connection is closed")
+                    msg = await self._conn.recv()
+                    self._own_loop.create_task(self._handle_message(msg))
+            except Exception as e:
+                ws_module.logger.error(self._fmt_log("receive message loop exit, err: {}", e))
+                await self._disconnect()
+                if self._auto_reconnect:
+                    await self._reconnect()
+                else:
+                    raise e
 
     return CardAwareClient
 
@@ -479,6 +552,9 @@ class FeishuChannel(BaseChannel):
 
     async def start(self) -> None:
         """Start the Feishu bot with WebSocket long connection."""
+        if self._ws_thread is not None and self._ws_thread.is_alive():
+            logger.warning("Feishu WebSocket listener already running; ignoring duplicate start")
+            return
         if not FEISHU_AVAILABLE:
             logger.error("Feishu SDK not installed. Run: pip install lark-oapi")
             self.set_setup_state(
@@ -566,21 +642,19 @@ class FeishuChannel(BaseChannel):
         )
 
         # Start WebSocket client in a separate thread with reconnect loop.
-        # A dedicated event loop is created for this thread so that lark_oapi's
-        # module-level `loop = asyncio.get_event_loop()` picks up an idle loop
-        # instead of the already-running main asyncio loop, which would cause
-        # "This event loop is already running" errors.
+        # A dedicated event loop is created for this thread and bound to the
+        # client as ``_own_loop``: CardAwareClient schedules every task on it,
+        # so partners sharing the process never fight over the SDK's
+        # module-level ``loop`` global ("This event loop is already running" /
+        # cross-loop task crashes with more than one Feishu channel).
         def run_ws():
             import time
-
-            import lark_oapi.ws.client as _lark_ws_client
 
             ws_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(ws_loop)
             self._ws_loop = ws_loop
-            # Patch the module-level loop used by lark's ws Client.start()
-            _lark_ws_client.loop = ws_loop
             ws_client = self._ws_client
+            ws_client._own_loop = ws_loop
             try:
                 while self._running:
                     try:

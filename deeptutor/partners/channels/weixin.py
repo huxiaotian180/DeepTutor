@@ -120,6 +120,20 @@ def _has_downloadable_media_locator(media: dict[str, Any] | None) -> bool:
     )
 
 
+# WeChat renders ``[text](url)`` as a link but has no image markdown, so an
+# untouched ``![alt](path)`` reaches the reader as a literal ``!alt`` bound to
+# a path it cannot open. The file itself travels as a separate media message.
+_MARKDOWN_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
+
+
+def _demote_markdown_images(text: str) -> str:
+    """Keep an image tag's caption — WeChat cannot show the image in place."""
+    return _MARKDOWN_IMAGE_RE.sub(
+        lambda match: match.group(1).strip() or "[image]",
+        text,
+    )
+
+
 class WeixinConfig(DeliveryOverrides):
     """Personal WeChat channel configuration."""
 
@@ -966,7 +980,7 @@ class WeixinChannel(BaseChannel):
             self.logger.debug("Dropped invisible reasoning delta for {}", msg.chat_id)
             return
 
-        content = msg.content.strip()
+        content = _demote_markdown_images(msg.content).strip()
 
         # Empty progress messages (e.g. after_iteration tool_events) must
         # NOT act as separators — they have no visible content.
@@ -1010,48 +1024,13 @@ class WeixinChannel(BaseChannel):
             for media_path in msg.media or []:
                 try:
                     await self._send_media_file(msg.chat_id, media_path, ctx_token)
-                except (httpx.TimeoutException, httpx.TransportError):
-                    # Network/transport errors: do NOT fall back to text —
-                    # the text send would also likely fail, and the outer
-                    # except will re-raise so ChannelManager retries properly.
-                    self.logger.opt(exception=True).warning(
-                        "Network error sending media {}",
-                        media_path,
-                    )
-                    raise
-                except httpx.HTTPStatusError as http_err:
-                    status_code = (
-                        http_err.response.status_code if http_err.response is not None else 0
-                    )
-                    if status_code >= 500:
-                        # Server-side / retryable HTTP error — same as network.
-                        self.logger.exception(
-                            "Server error ({} {}) sending media {}",
-                            status_code,
-                            http_err.response.reason_phrase
-                            if http_err.response is not None
-                            else "",
-                            media_path,
-                        )
-                        raise
-                    # 4xx client errors are NOT retryable — fall back to text.
-                    filename = Path(media_path).name
-                    self.logger.exception("Failed to send media {}", media_path)
-                    await self._send_text(
-                        msg.chat_id,
-                        f"[Failed to send: {filename}]",
-                        ctx_token,
-                    )
                 except Exception:
-                    # Non-network errors (format, file-not-found, etc.):
-                    # notify the user via text fallback.
-                    filename = Path(media_path).name
-                    self.logger.exception("Failed to send media {}", media_path)
-                    # Notify user about failure via text
-                    await self._send_text(
-                        msg.chat_id,
-                        f"[Failed to send: {filename}]",
-                        ctx_token,
+                    # A generated attachment is supplementary: losing it must
+                    # never cost the reader the text answer, so log and keep
+                    # going rather than letting ChannelManager retry (and
+                    # ultimately drop) the whole reply.
+                    self.logger.opt(exception=True).warning(
+                        "Failed to send media {}", media_path
                     )
 
             # --- Send text content ---

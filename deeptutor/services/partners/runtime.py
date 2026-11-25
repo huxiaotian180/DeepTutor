@@ -31,6 +31,8 @@ import json
 import logging
 import mimetypes
 from pathlib import Path
+import shutil
+import tempfile
 from typing import Any, Awaitable, Callable
 import uuid
 
@@ -39,7 +41,7 @@ from deeptutor.core.stream import StreamEvent, StreamEventType
 from deeptutor.multi_user.paths import get_path_service_for_scope
 from deeptutor.partners.bus.events import InboundMessage, OutboundMessage
 from deeptutor.partners.bus.queue import MessageBus
-from deeptutor.partners.helpers import detect_image_mime
+from deeptutor.partners.helpers import detect_image_mime, safe_filename
 from deeptutor.services.partners.commands import PartnerCommandHandler
 from deeptutor.services.partners.interaction import (
     actor_for_account,
@@ -151,6 +153,75 @@ def _thread_delivery_meta(msg: InboundMessage) -> dict[str, Any]:
     return meta
 
 
+def _partner_relative_source(attachment: dict[str, Any], partner_id: str) -> Path | None:
+    """Locate an attachment inside the Partner's own workspace.
+
+    A Partner turn publishes into its private synthetic content workspace, and
+    that binding is gone once the turn ends, so the ``/files/workspace-items``
+    URL cannot resolve at delivery time (``The workspace is no longer
+    registered for this user``). The attachment still carries the
+    workspace-relative path the file was published under; resolve it against
+    the Partner's own roots, keeping the guard the files endpoint applies.
+    """
+    relative = str(attachment.get("relative_path") or "").strip()
+    if not relative or not partner_id:
+        return None
+    try:
+        service = get_path_service_for_scope(partner_scope(partner_id))
+    except Exception:
+        logger.warning("No path service for partner %s", partner_id, exc_info=True)
+        return None
+    for root in (service.get_workspace_dir(), service.get_public_outputs_root()):
+        candidate = (root / relative).resolve()
+        if service.is_public_output_path(candidate):
+            return candidate
+    return None
+
+
+def _attachments_as_media(
+    attachments: list[dict[str, Any]], *, partner_id: str = ""
+) -> list[str]:
+    """Named local copies of a turn's published files, uploadable by a channel.
+
+    Published files live as extension-less blobs, and IM uploads pick their
+    message type from the suffix and show the basename to the recipient, so the
+    originals are staged into a temp file named like the file the user saw.
+    """
+    from deeptutor.services.session.artifact_attachments import _resolve_artifact_path
+
+    media_dir = Path(tempfile.gettempdir()) / "deeptutor-im-media"
+    media_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[str] = []
+    staged: set[str] = set()
+    for attachment in attachments:
+        url = str(attachment.get("url") or "")
+        source = _resolve_artifact_path(url) if url else None
+        if source is None or not source.is_file():
+            source = _partner_relative_source(attachment, partner_id)
+        if source is None or not source.is_file():
+            # Silence here once cost a full round of "images never arrive on
+            # the channel" debugging: the reply went out text-only with
+            # nothing in the log to say the file had been dropped.
+            logger.warning(
+                "Could not locate %s for channel delivery; sending text only",
+                attachment.get("filename") or url or "<unnamed attachment>",
+            )
+            continue
+        key = str(attachment.get("sha256") or url)
+        if key in staged:
+            continue
+        staged.add(key)
+        name = safe_filename(str(attachment.get("filename") or source.name)) or source.name
+        target = media_dir / f"{uuid.uuid4().hex[:8]}-{name}"
+        try:
+            shutil.copyfile(source, target)
+        except OSError:
+            logger.warning("Could not stage %s for channel delivery", source, exc_info=True)
+            continue
+        paths.append(str(target))
+    return paths
+
+
 class PartnerRunner:
     """Consume a partner's inbound bus and answer with the chat agent loop."""
 
@@ -223,11 +294,13 @@ class PartnerRunner:
             )
 
         delivery_meta: dict[str, Any] = _thread_delivery_meta(msg)
+        captured: dict[str, Any] = {}
         try:
             final = await self.process_message(
                 msg,
                 on_event=on_event,
                 delivery_meta=delivery_meta,
+                captured=captured,
             )
         except Exception as exc:
             logger.exception(
@@ -239,17 +312,23 @@ class PartnerRunner:
             # after this full turn has already been mirrored.
             delivery_meta["_web_activity_mirrored"] = True
         if final:
-            await self._emit_channel_activity(
-                msg,
-                {
-                    "type": "content",
-                    "content": final,
-                    "activity_id": activity_id,
-                    "session_key": msg.session_key,
-                    "channel": msg.channel,
-                    "external": True,
-                },
-            )
+            frame: dict[str, Any] = {
+                "type": "content",
+                "content": final,
+                "activity_id": activity_id,
+                "session_key": msg.session_key,
+                "channel": msg.channel,
+                "external": True,
+            }
+            # The WebUI renders IM turns from this feed, and the replay window
+            # keeps only the question and the answer (stream events are dropped
+            # once a turn is done). Carry the published workspace items here too,
+            # otherwise a relative path the model wrote in its answer has nothing
+            # to resolve against and navigates to a dead route.
+            attachments = captured.get("attachments") or []
+            if attachments:
+                frame["attachments"] = attachments
+            await self._emit_channel_activity(msg, frame)
         await self._emit_channel_activity(
             msg,
             {
@@ -267,6 +346,13 @@ class PartnerRunner:
                     chat_id=msg.chat_id,
                     content=final,
                     metadata=delivery_meta,
+                    # Answers routinely reference workspace-relative paths
+                    # (``outputs/chat/...``) that only the WebUI can resolve, so a
+                    # channel client has nothing to open. Upload the produced
+                    # files themselves alongside the text.
+                    media=_attachments_as_media(
+                        captured.get("attachments") or [], partner_id=self.partner_id
+                    ),
                 )
             )
 
@@ -321,12 +407,17 @@ class PartnerRunner:
         on_event: EventCallback | None = None,
         delivery_meta: dict[str, Any] | None = None,
         options: PartnerTurnOptions | None = None,
+        captured: dict[str, Any] | None = None,
     ) -> str:
         """Run one chat turn for *msg* and return the final reply text.
 
         *delivery_meta*, when given, is filled with metadata the caller
         should attach to the final outbound message (e.g. ``_streamed``
         when the reply was already delivered live via stream deltas).
+
+        *captured*, when given, receives the turn's published workspace items
+        under ``"attachments"`` so a caller mirroring the turn elsewhere (the
+        WebUI activity feed) can hand them to its renderer.
         """
         self._identify(msg)
         options = options or PartnerTurnOptions()
@@ -352,6 +443,8 @@ class PartnerRunner:
                 delivery_meta=delivery_meta,
                 options=options,
             )
+            if captured is not None:
+                captured["attachments"] = list(generated_attachments)
             if options.persist:
                 activity_id = str((msg.metadata or {}).get("_web_activity_id") or "").strip()
                 activity_meta = {"activity_id": activity_id} if activity_id else None
