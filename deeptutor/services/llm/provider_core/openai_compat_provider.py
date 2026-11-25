@@ -494,6 +494,8 @@ class OpenAICompatProvider(LLMProvider):
             prepared.append(clean)
 
         sanitized = LLMProvider._sanitize_request_messages(prepared, _ALLOWED_MSG_KEYS)
+        if not responses_api:
+            sanitized = cls._restore_missing_tool_turn_reasoning(sanitized)
         if responses_api:
             # Responses function calls use the provider-issued ``call_id`` as
             # a protocol identity. The converter splits DeepTutor's compound
@@ -522,6 +524,39 @@ class OpenAICompatProvider(LLMProvider):
             if "tool_call_id" in clean and clean["tool_call_id"]:
                 clean["tool_call_id"] = map_id(clean["tool_call_id"])
         return sanitized
+
+    @staticmethod
+    def _restore_missing_tool_turn_reasoning(
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Give every tool-calling assistant turn a ``reasoning_content`` field.
+
+        A provider in thinking mode rejects the whole request when any
+        assistant turn that issued tool calls arrives without
+        ``reasoning_content`` — even when *that* round produced no reasoning
+        of its own, which the model decides per round. Only the round that
+        actually thought came back with text, so the later, terser tool turns
+        had nothing to replay and the loop correctly omitted the key. The
+        field is therefore restored as an empty string, not as invented text:
+        it tells the provider "this round had no reasoning", which is the
+        truth, and satisfies its presence check.
+
+        Gated on the request already carrying reasoning somewhere else. That
+        keeps the repair symmetric — a provider that never speaks the dialect
+        receives no new key, so strict endpoints are unaffected.
+        """
+        has_reasoning = any(
+            message.get("role") == "assistant"
+            and isinstance(message.get("reasoning_content"), str)
+            and message["reasoning_content"]
+            for message in messages
+        )
+        if not has_reasoning:
+            return messages
+        for message in messages:
+            if message.get("role") == "assistant" and message.get("tool_calls"):
+                message.setdefault("reasoning_content", "")
+        return messages
 
     # ------------------------------------------------------------------
     # Build kwargs
